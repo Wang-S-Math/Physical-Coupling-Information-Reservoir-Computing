@@ -1,0 +1,8 @@
+.venv/
+.idea/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+project_tree.txt
+file_sizes.txt
+file_sizes.csv

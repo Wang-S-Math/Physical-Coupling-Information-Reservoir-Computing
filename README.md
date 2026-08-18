@@ -13,7 +13,25 @@ lsl.kn.py         Rossler x-x coupling, known topology
 lsl.un.py         Rossler x-x coupling, unknown topology
 ```
 
-`configs.py` stores the experiment settings shared by these six scripts, including the corresponding data paths and size-dependent parameters. `generate.data/` contains the input time-series data and ground-truth adjacency matrices. `result.date/` contains the archived reconstruction and prediction results used for generating the manuscript figures.
+`configs.py` stores the experiment settings shared by these six scripts, including the corresponding data paths and size-dependent parameters.
+
+## Repository folders
+
+```text
+generate.data/          Input datasets used by the PCI-RC experiments, including the
+                        time-series data and ground-truth adjacency matrices for
+                        different network sizes.
+
+mathod/                 Auxiliary system-specific scripts for the three dynamical
+                        systems used in the experimental workflow.
+
+noise_results_llz_xy/   Saved outputs of the observational-noise robustness experiment
+                        for the nonlinear product-coupled Lorenz system, including the
+                        numerical results and the corresponding figure.
+
+result.data/            Archived reconstruction and dynamical-prediction results used
+                        by figure.ipynb to reproduce the manuscript figures.
+```
 
 To rerun one reconstruction experiment, run the corresponding Python script from the repository root. For example:
 

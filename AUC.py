@@ -513,7 +513,7 @@ if __name__ == "__main__":
     )
 
     # ===== 保存未经阈值截断的结果 =====
-    Path('result.date/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
+    Path('result.data/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
 
     raw_weights_name = (
         'result.date/llz.(x-x)/network/'
@@ -544,8 +544,8 @@ if __name__ == "__main__":
         coupling_strength=COUPLING_STRENGTH
     )
 
-    Path('result.date/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
-    Path('result.date/llz.(x-x)/dynamic').mkdir(parents=True, exist_ok=True)
+    Path('result.data/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
+    Path('result.data/llz.(x-x)/dynamic').mkdir(parents=True, exist_ok=True)
 
     save_weights_name = 'result.date/llz.(x-x)/network/10ROC1.(X-X)unknow_W_predicted.npy'
     save_dynamics_name = 'result.date/llz.(x-x)/dynamic/10ROC1.(X-X)unknow_y_pred_traj.npy'

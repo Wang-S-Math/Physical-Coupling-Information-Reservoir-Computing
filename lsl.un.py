@@ -1,5 +1,6 @@
-
 import numpy as np
+import csv
+import gc
 from pathlib import Path
 from scipy import linalg
 
@@ -12,9 +13,6 @@ from configs import get_config
 def evaluate_xu_metrics(W_true, W_pred, threshold=0.01):
     """
     Calculate TPR, TNR, Precision, and relative weight error.
-
-    All topology-related metrics are evaluated over off-diagonal entries
-    only, excluding self-connections, consistent with the manuscript.
     """
     W_true = np.asarray(W_true, dtype=float)
     W_pred = np.asarray(W_pred, dtype=float)
@@ -42,12 +40,12 @@ def evaluate_xu_metrics(W_true, W_pred, threshold=0.01):
     Error = diff_norm / true_norm if true_norm > 0 else 0.0
 
     return TPR, TNR, Precision, Error
+
+
 def calculate_vps(y_true, y_pred, threshold=0.5):
     """
     计算有效预测时间 (Valid Prediction Time / VPS)
-    依据归一化均方根误差 (NRMSE) 是否超过阈值。
     """
-    # 展平为 [Steps, Features] 以便统一计算
     y_true_flat = y_true.reshape(y_true.shape[0], -1)
     y_pred_flat = y_pred.reshape(y_pred.shape[0], -1)
 
@@ -55,16 +53,11 @@ def calculate_vps(y_true, y_pred, threshold=0.5):
     y_true_flat = y_true_flat[:length]
     y_pred_flat = y_pred_flat[:length]
 
-    # 按列(特征)计算标准差用于归一化, shape=(Features,)
     std_val = np.std(y_true_flat, axis=0) + 1e-6
-
-    # 使用展平后的变量进行计算
     diff = (y_true_flat - y_pred_flat) / std_val
 
-    # 每个时间步的全局误差 (所有节点和维度的均方根)
     error_norm = np.sqrt(np.mean(diff ** 2, axis=1))
 
-    # 找到第一个超过阈值的时间点
     indices = np.where(error_norm > threshold)[0]
     vps = indices[0] if len(indices) > 0 else length
 
@@ -75,18 +68,27 @@ def calculate_vps(y_true, y_pred, threshold=0.5):
 # 1. 核心类：统一的储备池 (Unified Reservoir)
 # ==========================================
 class Reservoir:
-    def __init__(self, input_dim, res_size, spectral_radius=0.95, leakage=0.25, input_scale=0.1, seed=42):
+    def __init__(self, input_dim, res_size, spectral_radius=0.95,
+                 leakage=0.25, input_scale=0.1, seed=42):
+
         self.input_dim = input_dim
         self.res_size = res_size
         self.alpha = leakage
         self.input_scale = input_scale
 
         np.random.seed(seed)
-        self.Win = (np.random.rand(res_size, input_dim) * 2 - 1) * input_scale
+
+        self.Win = (
+            np.random.rand(res_size, input_dim) * 2 - 1
+        ) * input_scale
+
         W = np.random.rand(res_size, res_size) * 2 - 1
         radius = np.max(np.abs(linalg.eigvals(W)))
         self.Wres = W * (spectral_radius / radius)
-        self.bias = (np.random.rand(res_size) * 2 - 1) * input_scale
+
+        self.bias = (
+            np.random.rand(res_size) * 2 - 1
+        ) * input_scale
 
         self.state = np.zeros(res_size)
         self.Wout = None
@@ -98,24 +100,47 @@ class Reservoir:
 
         for t in range(T):
             u_t = u_data[t]
-            pre_activation = np.dot(self.Win, u_t) + np.dot(self.Wres, r_curr) + self.bias
-            r_curr = (1 - self.alpha) * r_curr + self.alpha * np.tanh(pre_activation)
+
+            pre_activation = (
+                np.dot(self.Win, u_t)
+                + np.dot(self.Wres, r_curr)
+                + self.bias
+            )
+
+            r_curr = (
+                (1 - self.alpha) * r_curr
+                + self.alpha * np.tanh(pre_activation)
+            )
+
             states[t] = r_curr
 
         self.state = r_curr
         return states
 
     def step(self, u_in):
-        pre_activation = np.dot(self.Win, u_in) + np.dot(self.Wres, self.state) + self.bias
-        self.state = (1 - self.alpha) * self.state + self.alpha * np.tanh(pre_activation)
+        pre_activation = (
+            np.dot(self.Win, u_in)
+            + np.dot(self.Wres, self.state)
+            + self.bias
+        )
+
+        self.state = (
+            (1 - self.alpha) * self.state
+            + self.alpha * np.tanh(pre_activation)
+        )
+
         return self.state
 
     def set_readout_weights(self, Wout_trained):
         self.Wout = Wout_trained
 
 
-# 2.物理耦合计算
-def get_coupling_term(u_state, adj_matrix, coupling_strength=1.0, coupling_mask=None):
+# ==========================================
+# 2. 物理耦合计算
+# ==========================================
+def get_coupling_term(u_state, adj_matrix, coupling_strength=1.0,
+                      coupling_mask=None):
+
     effective_adj = adj_matrix * coupling_strength
     weighted_sum = effective_adj @ u_state
     row_sums = np.sum(effective_adj, axis=1)[:, np.newaxis]
@@ -129,46 +154,67 @@ def get_coupling_term(u_state, adj_matrix, coupling_strength=1.0, coupling_mask=
     return full_coupling
 
 
+# ==========================================
 # 3. 第一阶段：盲预测参数辨识 (Blind Identification)
-def stage_1_predict_weights_blind(time_series, dt=0.01, train_len=15000, sync_len=1000,
-                                  res_size=500,
-                                  lambda_ridge=1e-3,
-                                  lambda_net=1e-7,
-                                  coupling_dims=[1, 0, 0], coupling_strength=0.5,
-                                  positive_only=True,
-                                  threshold=0.01):
+# ==========================================
+def stage_1_predict_weights_blind(
+        time_series, dt=0.01, train_len=15000, sync_len=1000,
+        res_size=500, lambda_ridge=1e-3, lambda_net=1e-7,
+        coupling_dims=[1, 0, 0], coupling_strength=0.5,
+        positive_only=True, threshold=0.01, seed_offset=0):
+
     """
-    专门处理【未知结构】的情况。
-    假设所有节点之间都可能存在连接（全连接假设），通过岭回归和阈值截断来重构网络。
+    未知拓扑：
+    假设所有节点之间都可能存在连接，通过岭回归和阈值截断重构网络。
     """
+
     print("\n" + "=" * 60)
     print("STAGE 1: 盲预测参数辨识 (Blind Parameter Identification)")
-    print(f"模式: [未知结构/全连接假设] - 计算所有可能的连接并应用阈值。")
+    print("模式: [未知结构/全连接假设] - 计算所有可能的连接并应用阈值。")
+
     if positive_only:
-        print(f"约束: [Positive Only] - 强制权重非负。")
+        print("约束: [Positive Only] - 强制权重非负。")
+
     print("=" * 60)
 
     steps, N_nodes, dim = time_series.shape
     coupling_mask = np.array(coupling_dims)
+
     U_curr = time_series[sync_len: train_len - 1]
     U_next = time_series[sync_len + 1: train_len]
+
     Y_target_deriv = (U_next - U_curr) / dt
 
     W_pred_matrix = np.zeros((N_nodes, N_nodes))
     trained_reservoirs = []
 
     for i in range(N_nodes):
-        res = Reservoir(input_dim=dim, res_size=res_size, input_scale=0.05, seed=43 + i)
-        r_full = res.run_states(time_series[:train_len, i, :])
+
+        res = Reservoir(
+            input_dim=dim,
+            res_size=res_size,
+            input_scale=0.05,
+            seed=43 + i + seed_offset
+        )
+
+        r_full = res.run_states(
+            time_series[:train_len, i, :]
+        )
+
         r_i = r_full[sync_len: train_len - 1]
 
-        # === 核心逻辑：盲预测 ===
-        # 不使用 known_structure，假设除自己外的所有节点都是潜在邻居
-        potential_neighbors = np.delete(np.arange(N_nodes), i)
+        # 未知拓扑：除自身外，其他节点均作为潜在邻居
+        potential_neighbors = np.delete(
+            np.arange(N_nodes), i
+        )
 
         C_list = []
+
         for j in potential_neighbors:
-            diff = (U_curr[:, j, :] - U_curr[:, i, :]) * coupling_mask
+            diff = (
+                U_curr[:, j, :] - U_curr[:, i, :]
+            ) * coupling_mask
+
             C_list.append(diff)
 
         if len(C_list) > 0:
@@ -178,9 +224,18 @@ def stage_1_predict_weights_blind(time_series, dt=0.01, train_len=15000, sync_le
             L_i = r_i
 
         total_params = L_i.shape[1]
+
         Lambda = np.zeros((total_params, total_params))
-        np.fill_diagonal(Lambda[:res_size, :res_size], lambda_ridge)
-        np.fill_diagonal(Lambda[res_size:, res_size:], lambda_net)
+
+        np.fill_diagonal(
+            Lambda[:res_size, :res_size],
+            lambda_ridge
+        )
+
+        np.fill_diagonal(
+            Lambda[res_size:, res_size:],
+            lambda_net
+        )
 
         y_i = Y_target_deriv[:, i, :]
 
@@ -194,29 +249,49 @@ def stage_1_predict_weights_blind(time_series, dt=0.01, train_len=15000, sync_le
 
         W_readout_i = Xi[:res_size, :]
         res.set_readout_weights(W_readout_i.T)
+
         trained_reservoirs.append(res)
 
         if len(C_list) > 0:
+
             neighbor_params = Xi[res_size:, :]
             idx_ptr = 0
+
             for k, neighbor_idx in enumerate(potential_neighbors):
-                w_block = neighbor_params[idx_ptr: idx_ptr + dim, :]
+
+                w_block = neighbor_params[
+                    idx_ptr: idx_ptr + dim, :
+                ]
+
                 valid_vals = []
+
                 for d in range(dim):
                     if coupling_dims[d] > 0:
                         valid_vals.append(w_block[d, d])
 
-                eff_weight_val = np.mean(valid_vals) if valid_vals else 0
+                eff_weight_val = (
+                    np.mean(valid_vals) if valid_vals else 0
+                )
+
+                # 非负权重处理
                 if positive_only and eff_weight_val < 0:
                     eff_weight_val = 0.0
-                # 还原真实权重
-                real_weight_val = eff_weight_val / coupling_strength
+
+                # 恢复真实耦合权重
+                real_weight_val = (
+                    eff_weight_val / coupling_strength
+                )
 
                 W_pred_matrix[i, neighbor_idx] = real_weight_val
+
                 idx_ptr += dim
-    # 阈值处理逻辑
+
+    # 原有阈值处理
     W_pred_matrix[np.abs(W_pred_matrix) < threshold] = 0.0
-    print(f"参数辨识完成，已应用阈值截断 (Threshold={threshold})")
+
+    print(
+        f"参数辨识完成，已应用阈值截断 (Threshold={threshold})"
+    )
 
     return W_pred_matrix, trained_reservoirs
 
@@ -224,131 +299,282 @@ def stage_1_predict_weights_blind(time_series, dt=0.01, train_len=15000, sync_le
 # ==========================================
 # 4. 第二阶段：直接动力学预测
 # ==========================================
-def stage_2_direct_prediction(time_series, W_pred_real, trained_reservoirs, dt=0.01,
-                              start_step=15000, pred_len=1000,
-                              coupling_dims=[1, 0, 0], coupling_strength=0.05):
+def stage_2_direct_prediction(
+        time_series, W_pred_real, trained_reservoirs,
+        dt=0.01, start_step=15000, pred_len=1000,
+        coupling_dims=[1, 0, 0], coupling_strength=0.05):
+
     print("\n" + "=" * 60)
     print("STAGE 2: 直接动力学预测 (Direct Prediction)")
     print("=" * 60)
 
     steps, N_nodes, dim = time_series.shape
+
     curr_u = time_series[start_step - 1].copy()
     predictions = np.zeros((pred_len, N_nodes, dim))
 
     print(f"开始闭环预测 (Steps={pred_len})...")
 
     for t in range(pred_len):
-        curr_r_states = [res.state for res in trained_reservoirs]
+
+        curr_r_states = [
+            res.state for res in trained_reservoirs
+        ]
 
         def get_derivative(u_val):
-            phys_c = get_coupling_term(u_val, W_pred_real,
-                                       coupling_strength=coupling_strength,
-                                       coupling_mask=coupling_dims)
+
+            phys_c = get_coupling_term(
+                u_val,
+                W_pred_real,
+                coupling_strength=coupling_strength,
+                coupling_mask=coupling_dims
+            )
+
             d_dt = np.zeros_like(u_val)
+
             for i in range(N_nodes):
-                intrinsic_dyn = trained_reservoirs[i].Wout @ curr_r_states[i]
+
+                intrinsic_dyn = (
+                    trained_reservoirs[i].Wout
+                    @ curr_r_states[i]
+                )
+
                 d_dt[i] = intrinsic_dyn + phys_c[i]
+
             return d_dt
 
+        # RK4 积分
         k1 = get_derivative(curr_u)
+
         u_k2 = curr_u + 0.5 * dt * k1
         k2 = get_derivative(u_k2)
+
         u_k3 = curr_u + 0.5 * dt * k2
         k3 = get_derivative(u_k3)
+
         u_k4 = curr_u + dt * k3
         k4 = get_derivative(u_k4)
 
-        next_u = curr_u + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        next_u = curr_u + (dt / 6.0) * (
+            k1 + 2 * k2 + 2 * k3 + k4
+        )
+
         predictions[t] = next_u
 
         for i in range(N_nodes):
             trained_reservoirs[i].step(next_u[i])
+
         curr_u = next_u
 
     return predictions
 
 
-# 5. 主程序入口
-
-
-# ============================================================
-# Main experiment
-# ============================================================
+# ==========================================
+# 5. 主程序：自动运行20次实验
+# ==========================================
 if __name__ == "__main__":
-    # ============================================================
-    # Network size / 网络规模
-    # If you want reconstruction results for a different network size,
-    # change the value of M below.  (Change me)
-    # 如果想查看不同网络规模的重构结果，请修改下面的 M 值。（修改这里）
-    # ============================================================
-    M = 100  # Change me / 修改这里
+
+    # 只需要修改 M
+    M = 5
+
+    # 固定20次实验，不需要修改
+    N_RUNS = 20
+    SEED_STEP = 10000
+
     cfg = get_config("lsl", "unknown", M)
 
     data_path = Path(cfg["data_file"])
     adj_path = Path(cfg["adj_file"])
 
     if not data_path.exists():
-        raise FileNotFoundError(f"Time-series data not found: {data_path}")
+        raise FileNotFoundError(
+            f"Time-series data not found: {data_path}"
+        )
+
     if not adj_path.exists():
-        raise FileNotFoundError(f"Adjacency matrix not found: {adj_path}")
+        raise FileNotFoundError(
+            f"Adjacency matrix not found: {adj_path}"
+        )
 
     raw_data = np.load(data_path)
     true_adj = np.load(adj_path)
+
+    if raw_data.shape[1] != M or true_adj.shape != (M, M):
+        raise ValueError(
+            f"Data/adjacency size mismatch: data={raw_data.shape}, "
+            f"adjacency={true_adj.shape}, expected M={M}"
+        )
+
+    output_dir = Path(cfg["result_dir"]) / "20run_metrics"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    file_stem = f"lsl_unknown_M{M}_20runs"
+
+    raw_csv = output_dir / f"{file_stem}_raw.csv"
+    summary_csv = output_dir / f"{file_stem}_summary.csv"
+
+    columns = [
+        "system", "topology", "M", "run", "seed_offset",
+        "Error", "TPR", "TNR", "Precision", "VPS"
+    ]
+
+    rows = []
+
     print(f"Loaded data: {raw_data.shape}")
     print(f"System=lsl, topology=unknown, M={M}")
+    print(f"Threshold={cfg['threshold']}")
+    print(f"Running {N_RUNS} independent reservoir realizations.")
+    print(f"Per-run results: {raw_csv}")
 
-    W_predicted, trained_models = stage_1_predict_weights_blind(
-        raw_data,
-        dt=cfg["dt"],
-        train_len=cfg["train_len"],
-        sync_len=cfg["sync_len"],
-        res_size=cfg["res_size"],
-        lambda_ridge=cfg["lambda_ridge"],
-        lambda_net=cfg["lambda_net"],
-        coupling_dims=list(cfg["coupling_dims"]),
-        coupling_strength=cfg["coupling_strength"],
-        positive_only=True,
-        threshold=cfg["threshold"],
-    )
+    with raw_csv.open(
+            "w", newline="", encoding="utf-8-sig") as f:
 
-    y_pred_traj = stage_2_direct_prediction(
-        raw_data,
-        W_pred_real=W_predicted,
-        trained_reservoirs=trained_models,
-        dt=cfg["dt"],
-        start_step=cfg["train_len"],
-        pred_len=cfg["pred_len"],
-        coupling_dims=list(cfg["coupling_dims"]),
-        coupling_strength=cfg["coupling_strength"],
-    )
+        writer = csv.DictWriter(
+            f, fieldnames=columns
+        )
 
+        writer.writeheader()
 
-    y_true_traj = raw_data[cfg["train_len"]: cfg["train_len"] + cfg["pred_len"]]
-    vps, _ = calculate_vps(y_true_traj, y_pred_traj, threshold=cfg["vps_threshold"])
+        for run_idx in range(N_RUNS):
 
-    tpr, tnr, precision, weight_error = evaluate_xu_metrics(
-        true_adj,
-        W_predicted,
-        threshold=cfg["threshold"],
-    )
-    print(f"TPR: {tpr:.4f}")
-    print(f"TNR: {tnr:.4f}")
-    print(f"Precision: {precision:.4f}")
-    print(f"Struct Error: {weight_error:.6f}")
-    print(f"VPS: {vps} steps (threshold={cfg['vps_threshold']})")
+            run_no = run_idx + 1
+            seed_offset = run_idx * SEED_STEP
 
-    # ============================================================
-    # Matrix comparison / 矩阵结果对比
-    # ============================================================
-    np.set_printoptions(precision=5, suppress=True, linewidth=200)
+            print(
+                f"\n[Run {run_no}/{N_RUNS}] "
+                f"seed_offset={seed_offset}"
+            )
 
-    print("\nGround-truth weighted adjacency matrix (W_true):")
-    print("真实加权邻接矩阵 (W_true):")
-    print(true_adj)
+            W_predicted, trained_models = (
+                stage_1_predict_weights_blind(
+                    raw_data,
+                    dt=cfg["dt"],
+                    train_len=cfg["train_len"],
+                    sync_len=cfg["sync_len"],
+                    res_size=cfg["res_size"],
+                    lambda_ridge=cfg["lambda_ridge"],
+                    lambda_net=cfg["lambda_net"],
+                    coupling_dims=list(cfg["coupling_dims"]),
+                    coupling_strength=cfg["coupling_strength"],
+                    positive_only=True,
+                    threshold=cfg["threshold"],
+                    seed_offset=seed_offset
+                )
+            )
 
-    print("\nReconstructed weighted adjacency matrix (W_pred):")
-    print("重构加权邻接矩阵 (W_pred):")
-    print(W_predicted)
+            tpr, tnr, precision, weight_error = (
+                evaluate_xu_metrics(
+                    true_adj,
+                    W_predicted,
+                    threshold=cfg["threshold"]
+                )
+            )
 
-    print("No result files are written by this script.")
-    print("Done.")
+            vps_value = ""
+
+            # 只有 M=10 才执行动力学预测
+            if M == 10:
+
+                y_pred_traj = stage_2_direct_prediction(
+                    raw_data,
+                    W_pred_real=W_predicted,
+                    trained_reservoirs=trained_models,
+                    dt=cfg["dt"],
+                    start_step=cfg["train_len"],
+                    pred_len=cfg["pred_len"],
+                    coupling_dims=list(cfg["coupling_dims"]),
+                    coupling_strength=cfg["coupling_strength"]
+                )
+
+                y_true_traj = raw_data[
+                    cfg["train_len"]:
+                    cfg["train_len"] + cfg["pred_len"]
+                ]
+
+                vps_value, _ = calculate_vps(
+                    y_true_traj,
+                    y_pred_traj,
+                    threshold=cfg["vps_threshold"]
+                )
+
+            row = {
+                "system": "lsl",
+                "topology": "unknown",
+                "M": M,
+                "run": run_no,
+                "seed_offset": seed_offset,
+                "Error": weight_error,
+                "TPR": tpr,
+                "TNR": tnr,
+                "Precision": precision,
+                "VPS": vps_value
+            }
+
+            writer.writerow(row)
+            f.flush()
+
+            rows.append(row)
+
+            if vps_value == "":
+                print(
+                    f"Run {run_no}: "
+                    f"Error={weight_error:.8f}, "
+                    f"TPR={tpr:.6f}, "
+                    f"TNR={tnr:.6f}, "
+                    f"Precision={precision:.6f}"
+                )
+            else:
+                print(
+                    f"Run {run_no}: "
+                    f"Error={weight_error:.8f}, "
+                    f"TPR={tpr:.6f}, "
+                    f"TNR={tnr:.6f}, "
+                    f"Precision={precision:.6f}, "
+                    f"VPS={vps_value}"
+                )
+
+            if M == 10:
+                del y_pred_traj, y_true_traj
+
+            del trained_models, W_predicted
+            gc.collect()
+
+    # ==========================================
+    # 20次实验统计：均值和样本标准差
+    # ==========================================
+    metrics = [
+        "Error", "TPR", "TNR", "Precision"
+    ]
+
+    if M == 10:
+        metrics.append("VPS")
+
+    with summary_csv.open(
+            "w", newline="", encoding="utf-8-sig") as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["metric", "n", "mean", "std"]
+        )
+
+        writer.writeheader()
+
+        for metric in metrics:
+
+            values = np.asarray(
+                [float(r[metric]) for r in rows],
+                dtype=float
+            )
+
+            writer.writerow({
+                "metric": metric,
+                "n": len(values),
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values, ddof=1))
+            })
+
+    print("\n" + "=" * 65)
+    print("20-run experiment completed.")
+    print(f"Raw results: {raw_csv}")
+    print(f"Summary:     {summary_csv}")
+    print("=" * 65)

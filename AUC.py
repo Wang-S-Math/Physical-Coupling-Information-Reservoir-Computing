@@ -9,9 +9,12 @@ from pathlib import Path
 
 # 0. 评价指标 (Metrics)
 def evaluate_xu_metrics(W_true, W_pred, threshold=0.01):
+    # 统一排除主对角线元素，仅评价非对角元素 (i != j)。
     N = W_true.shape[0]
-    A_true = (np.abs(W_true) > 1e-6).astype(int)
-    A_pred = (np.abs(W_pred) > threshold).astype(int)
+    mask = ~np.eye(N, dtype=bool)
+
+    A_true = (np.abs(W_true) > 1e-6)[mask].astype(int)
+    A_pred = (W_pred > threshold)[mask].astype(int)
 
     P_count = np.sum(A_true)
     TP_count = np.sum(A_true * A_pred)
@@ -21,8 +24,11 @@ def evaluate_xu_metrics(W_true, W_pred, threshold=0.01):
     TN_count = np.sum((1 - A_true) * (1 - A_pred))
     TNR = TN_count / N_neg_count if N_neg_count > 0 else 0.0
 
-    diff_norm = np.linalg.norm(W_pred - W_true, 'fro')
-    true_norm = np.linalg.norm(W_true, 'fro')
+    # Error 也只在非对角元素上计算，与论文中的指标定义保持一致。
+    diff = (W_pred - W_true)[mask]
+    true = W_true[mask]
+    diff_norm = np.linalg.norm(diff)
+    true_norm = np.linalg.norm(true)
     Error = diff_norm / true_norm if true_norm > 0 else 0.0
 
     return TPR, TNR, Error
@@ -65,7 +71,7 @@ def evaluate_threshold_metrics(W_true, W_pred):
     mask = ~np.eye(n, dtype=bool)
 
     A_true = np.abs(W_true) > 1e-6
-    A_pred = np.abs(W_pred) > 1e-15
+    A_pred = W_pred > 1e-15
 
     yt = A_true[mask]
     yp = A_pred[mask]
@@ -103,8 +109,8 @@ def threshold_sensitivity_analysis(
     rows = []
 
     for xi in thresholds:
-        W_thr = W_raw.copy()
-        W_thr[np.abs(W_thr) < xi] = 0.0
+        W_thr = np.maximum(W_raw, 0.0)
+        W_thr[W_thr < xi] = 0.0
 
         TPR, TNR, FPR, Precision, Error, TP, TN, FP, FN = \
             evaluate_threshold_metrics(W_true, W_thr)
@@ -412,6 +418,10 @@ def stage_1_predict_weights_blind(time_series, dt=0.01, train_len=15000, sync_le
                 W_pred_matrix[i, neighbor_idx] = real_weight_val
                 idx_ptr += dim
 
+    # Apply the nonnegative projection after regression and before thresholding.
+    if positive_only:
+        W_pred_matrix = np.maximum(W_pred_matrix, 0.0)
+
     # --- 新增：打印未经截断的权重 ---
     print("\n[Raw Weights] 未经阈值截断的预测连接权重矩阵:")
     with np.printoptions(precision=5, suppress=True):
@@ -424,7 +434,7 @@ def stage_1_predict_weights_blind(time_series, dt=0.01, train_len=15000, sync_le
 
     # 当前论文设定阈值下的截断结果
     W_pred_thresholded = W_pred_raw.copy()
-    W_pred_thresholded[np.abs(W_pred_thresholded) < threshold] = 0.0
+    W_pred_thresholded[W_pred_thresholded < threshold] = 0.0
     print(f"参数辨识完成，已应用阈值截断 (Threshold={threshold})")
 
     return W_pred_raw, W_pred_thresholded, trained_reservoirs
@@ -513,7 +523,7 @@ if __name__ == "__main__":
     )
 
     # ===== 保存未经阈值截断的结果 =====
-    Path('result.data/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
+    Path('run20.result.date/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
 
     raw_weights_name = (
         'result.date/llz.(x-x)/network/'
@@ -544,8 +554,8 @@ if __name__ == "__main__":
         coupling_strength=COUPLING_STRENGTH
     )
 
-    Path('result.data/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
-    Path('result.data/llz.(x-x)/dynamic').mkdir(parents=True, exist_ok=True)
+    Path('run20.result.date/llz.(x-x)/network').mkdir(parents=True, exist_ok=True)
+    Path('run20.result.date/llz.(x-x)/dynamic').mkdir(parents=True, exist_ok=True)
 
     save_weights_name = 'result.date/llz.(x-x)/network/10ROC1.(X-X)unknow_W_predicted.npy'
     save_dynamics_name = 'result.date/llz.(x-x)/dynamic/10ROC1.(X-X)unknow_y_pred_traj.npy'

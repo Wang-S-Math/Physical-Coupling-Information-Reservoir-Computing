@@ -1,5 +1,8 @@
 
+
 import numpy as np
+import csv
+import gc
 from pathlib import Path
 from scipy import linalg
 
@@ -112,7 +115,7 @@ def get_coupling_term(u_state, adj_matrix, coupling_strength=1.0, coupling_mask=
 def stage_1_predict_weights_with_structure(time_series, dt=0.01, train_len=15000, sync_len=1000,
                                            res_size=500, lambda_ridge=1e-3, lambda_net=1e-7,
                                            coupling_dims=[1, 0, 0], coupling_strength=0.1,
-                                           known_structure=None):
+                                           known_structure=None, seed_offset=0):
     # === 强制检查：必须提供 known_structure ===
     if known_structure is None:
         raise ValueError("错误: 此代码仅支持已知结构模式，请提供 known_structure 参数 (Mask矩阵)。")
@@ -132,7 +135,7 @@ def stage_1_predict_weights_with_structure(time_series, dt=0.01, train_len=15000
     trained_reservoirs = []
 
     for i in range(N_nodes):
-        res = Reservoir(input_dim=dim, res_size=res_size, input_scale=0.1, seed=42 + i)
+        res = Reservoir(input_dim=dim, res_size=res_size, input_scale=0.1, seed=42 + i + seed_offset)
         r_full = res.run_states(time_series[:train_len, i, :])
         r_i = r_full[sync_len: train_len - 1]
 
@@ -198,9 +201,10 @@ def stage_1_predict_weights_with_structure(time_series, dt=0.01, train_len=15000
                 W_pred_matrix[i, neighbor_idx] = real_weight_val
                 idx_ptr += dim
 
-    # === 移除阈值逻辑：已知结构下直接保留计算出的原始值 ===
-    # 不再进行 W_pred_matrix[abs < threshold] = 0 的操作
+    # === 已知结构下进行非负投影，不应用阈值截断 ===
+    # 非负投影后保留权重，不进行阈值截断。
 
+    W_pred_matrix = np.maximum(W_pred_matrix, 0.0)
     return W_pred_matrix, trained_reservoirs
 
 
@@ -256,15 +260,14 @@ def stage_2_direct_prediction(time_series, W_pred_real, trained_reservoirs, dt=0
 # Main experiment
 # ============================================================
 if __name__ == "__main__":
-    # ============================================================
-    # Network size / 网络规模
-    # If you want reconstruction results for a different network size,
-    # change the value of M below.  (Change me)
-    # 如果想查看不同网络规模的重构结果，请修改下面的 M 值。（修改这里）
-    # ============================================================
-    M = 100 # Change me / 修改这里
-    cfg = get_config("llz_xy", "known", M)
+    # Set M to the network size to be evaluated.
+    # VPS is calculated only when M == 10; reconstruction metrics are
+    # collected for every network size.
+    M = 5  # Change to 10 for VPS runs; otherwise use the required network size
+    N_RUNS = 20
+    SEED_STEP = 10000
 
+    cfg = get_config("llz_xy", "known", M)
     data_path = Path(cfg["data_file"])
     adj_path = Path(cfg["adj_file"])
 
@@ -275,55 +278,111 @@ if __name__ == "__main__":
 
     raw_data = np.load(data_path)
     true_adj = np.load(adj_path)
-    print(f"Loaded data: {raw_data.shape}")
-    print(f"System=llz_xy, topology=known, M={M}")
+    if raw_data.shape[1] != M or true_adj.shape != (M, M):
+        raise ValueError(
+            f"Data/adjacency size mismatch: data={raw_data.shape}, "
+            f"adjacency={true_adj.shape}, expected M={M}"
+        )
 
     known_mask = (np.abs(true_adj) > 1e-6).astype(int)
+    output_dir = Path(cfg["result_dir"]) / "20run_metrics"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    file_stem = f"llz_xy_known_M{M}_20runs"
+    raw_csv = output_dir / f"{file_stem}_raw.csv"
+    summary_csv = output_dir / f"{file_stem}_summary.csv"
 
-    W_predicted, trained_models = stage_1_predict_weights_with_structure(
-        raw_data,
-        dt=cfg["dt"],
-        train_len=cfg["train_len"],
-        sync_len=cfg["sync_len"],
-        res_size=cfg["res_size"],
-        lambda_ridge=cfg["lambda_ridge"],
-        lambda_net=cfg["lambda_net"],
-        coupling_dims=list(cfg["coupling_dims"]),
-        coupling_strength=cfg["coupling_strength"],
-        known_structure=known_mask,
-    )
+    columns = ["system", "topology", "M", "run", "seed_offset", "Error", "VPS"]
+    rows = []
+    print(f"Loaded data: {raw_data.shape}")
+    print(f"System=llz_xy, topology=known, M={M}")
+    print(f"Running {N_RUNS} independent reservoir realizations.")
+    print(f"Per-run results: {raw_csv}")
 
-    y_pred_traj = stage_2_direct_prediction(
-        raw_data,
-        W_pred_real=W_predicted,
-        trained_reservoirs=trained_models,
-        dt=cfg["dt"],
-        start_step=cfg["train_len"],
-        pred_len=cfg["pred_len"],
-        coupling_dims=list(cfg["coupling_dims"]),
-        coupling_strength=cfg["coupling_strength"],
-    )
+    # Write each completed run immediately, so completed results are retained
+    # even if a later run is interrupted.
+    with raw_csv.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for run_idx in range(N_RUNS):
+            run_no = run_idx + 1
+            seed_offset = run_idx * SEED_STEP
+            print(f"\n[Run {run_no}/{N_RUNS}] seed_offset={seed_offset}")
 
+            W_predicted, trained_models = stage_1_predict_weights_with_structure(
+                raw_data,
+                dt=cfg["dt"],
+                train_len=cfg["train_len"],
+                sync_len=cfg["sync_len"],
+                res_size=cfg["res_size"],
+                lambda_ridge=cfg["lambda_ridge"],
+                lambda_net=cfg["lambda_net"],
+                coupling_dims=list(cfg["coupling_dims"]),
+                coupling_strength=cfg["coupling_strength"],
+                known_structure=known_mask,
+                seed_offset=seed_offset,
+            )
 
-    y_true_traj = raw_data[cfg["train_len"]: cfg["train_len"] + cfg["pred_len"]]
-    vps, _ = calculate_vps(y_true_traj, y_pred_traj, threshold=cfg["vps_threshold"])
+            weight_error = evaluate_weight_error(true_adj, W_predicted)
+            vps_value = ""
 
-    weight_error = evaluate_weight_error(true_adj, W_predicted)
-    print(f"Weight Frobenius Error: {weight_error:.6f}")
-    print(f"VPS: {vps} steps (threshold={cfg['vps_threshold']})")
+            # Dynamics prediction is required only for the three M=10 systems.
+            if M == 10:
+                y_pred_traj = stage_2_direct_prediction(
+                    raw_data,
+                    W_pred_real=W_predicted,
+                    trained_reservoirs=trained_models,
+                    dt=cfg["dt"],
+                    start_step=cfg["train_len"],
+                    pred_len=cfg["pred_len"],
+                    coupling_dims=list(cfg["coupling_dims"]),
+                    coupling_strength=cfg["coupling_strength"],
+                )
+                y_true_traj = raw_data[
+                    cfg["train_len"]: cfg["train_len"] + cfg["pred_len"]
+                ]
+                vps_value, _ = calculate_vps(
+                    y_true_traj, y_pred_traj, threshold=cfg["vps_threshold"]
+                )
 
-    # ============================================================
-    # Matrix comparison / 矩阵结果对比
-    # ============================================================
-    np.set_printoptions(precision=5, suppress=True, linewidth=200)
+            row = {
+                "system": "llz_xy",
+                "topology": "known",
+                "M": M,
+                "run": run_no,
+                "seed_offset": seed_offset,
+                "Error": weight_error,
+                "VPS": vps_value,
+            }
+            writer.writerow(row)
+            f.flush()
+            rows.append(row)
+            if vps_value == "":
+                print(f"Run {run_no}: Error={weight_error:.8f}")
+            else:
+                print(f"Run {run_no}: Error={weight_error:.8f}, VPS={vps_value}")
 
-    print("\nGround-truth weighted adjacency matrix (W_true):")
-    print("真实加权邻接矩阵 (W_true):")
-    print(true_adj)
+            # Release per-run model objects before constructing the next realization.
+            if M == 10:
+                del y_pred_traj, y_true_traj
+            del trained_models, W_predicted
+            gc.collect()
 
-    print("\nReconstructed weighted adjacency matrix (W_pred):")
-    print("重构加权邻接矩阵 (W_pred):")
-    print(W_predicted)
+    # Sample standard deviation (ddof=1), matching the 20-realization summary.
+    metrics = ["Error"] + (["VPS"] if M == 10 else [])
+    with summary_csv.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=["metric", "n", "mean", "std"])
+        writer.writeheader()
+        for metric in metrics:
+            values = np.asarray([float(r[metric]) for r in rows], dtype=float)
+            writer.writerow({
+                "metric": metric,
+                "n": len(values),
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values, ddof=1)),
+            })
 
-    print("No result files are written by this script.")
-    print("Done.")
+    print("\n" + "=" * 65)
+    print("20-run experiment completed.")
+    print(f"Raw results: {raw_csv}")
+    print(f"Summary:     {summary_csv}")
+    print("=" * 65)

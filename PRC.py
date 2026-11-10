@@ -1,73 +1,180 @@
+"""Parallel reservoir computing (PRC) baseline used in the PCI-RC paper.
 
-import os
+The neighboring state component is selected according to the coupling form:
+- Lorenz (x-x): x_j (component 0)
+- Lorenz (x-y): y_j (component 1)
+- Rössler (x-x): x_j (component 0)
+
+Run this script from any working directory. Predictions are saved using the
+filenames expected by figure.ipynb under result.data/PRC/.
+"""
+
+import shutil
+from pathlib import Path
+
 import numpy as np
 from numpy import zeros, tanh
-from rcnp import rcnp
 
+from rcnp import rcnp
 from prc_configs import get_prc_config
 
 
-# 2. 补充函数 qiufei0
+PROJECT_DIR = Path(__file__).resolve().parent
+
+
+def _project_path(relative_path):
+    """Resolve a repository-relative path against the project directory."""
+    path = Path(relative_path)
+    return path if path.is_absolute() else PROJECT_DIR / path
+
+
+def _is_git_lfs_pointer(path):
+    """Return True if a file is a Git LFS pointer rather than its binary data."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(200)
+        return b"version https://git-lfs.github.com/spec/v1" in header
+    except OSError:
+        return False
+
+
+def _load_npy(path, description):
+    """Load a real .npy file and give a useful error for Git LFS pointers."""
+    if not path.exists():
+        raise FileNotFoundError(f"{description} not found: {path}")
+    if _is_git_lfs_pointer(path):
+        raise RuntimeError(
+            f"{description} is only a Git LFS pointer, not the actual .npy file:\n"
+            f"  {path}\n"
+            "Please obtain the Git LFS objects (for example, run `git lfs pull` "
+            "inside a Git clone of the repository) and run this script again."
+        )
+    try:
+        return np.load(path, allow_pickle=False)
+    except Exception as exc:
+        raise RuntimeError(f"Could not load {description}: {path}\n{exc}") from exc
+
+
 def qiufei0(ww):
-    wl = []
-    N = ww.shape[0]
-    for i in range(N):
-        # 找出第 i 行中非零的元素索引 (即 i 的邻居)
-        # 使用 != 0 以支持负权重（排斥耦合）
-        neighbors = np.where(ww[i] != 0)[0]
-        wl.append(neighbors)
-    return wl
+    """Return the neighbor indices for each node (all nonzero weights)."""
+    ww = np.asarray(ww)
+    if ww.ndim != 2 or ww.shape[0] != ww.shape[1]:
+        raise ValueError(f"The weighted adjacency matrix must be square; got {ww.shape}.")
+    if not np.all(np.isfinite(ww)):
+        raise ValueError("The weighted adjacency matrix contains NaN or infinite values.")
+
+    neighbors_by_node = []
+    for i in range(ww.shape[0]):
+        # Nonzero entries include both positive and negative inferred weights.
+        neighbors_by_node.append(np.flatnonzero(ww[i] != 0))
+    return neighbors_by_node
 
 
-def CCB4_2_2_2(y1, y2, ww, nn=500, grla=1e-6, grg=0.7, pbj=0.95, xshl=0.03, grso=1.2, she=1000, ycn=10000, oo1=1,
-               oo2=0.5):
-    if ycn is None:
-        ycn = y2.shape[0]
+def CCB4_2_2_2(
+    y1,
+    y2,
+    ww,
+    nn=500,
+    grla=1e-6,
+    grg=0.7,
+    pbj=0.95,
+    xshl=0.03,
+    grso=1.2,
+    she=1000,
+    ycn=10000,
+    oo1=1,
+    oo2=0.5,
+    neighbor_component=0,
+):
+    """Train and run the PRC model.
+
+    Parameters
+    ----------
+    y1 : ndarray, shape (n_train, 3 * n_nodes)
+        Training trajectories, flattened node by node as (x_i, y_i, z_i).
+    y2 : ndarray, shape (n_test, 3 * n_nodes)
+        Reference test trajectories used only to calculate VPS.
+    ww : ndarray, shape (n_nodes, n_nodes)
+        Weighted adjacency matrix. Row i contains the weights used as inputs
+        from the neighbors of target node i.
+    neighbor_component : int
+        Neighbor-state component supplied to each reservoir: 0 for x_j,
+        1 for y_j, and 2 for z_j. This is selected from the system's coupling
+        form in prc_configs.py.
+    """
+    y1 = np.asarray(y1, dtype=float)
+    y2 = np.asarray(y2, dtype=float)
+    ww = np.asarray(ww, dtype=float)
+
+    if y1.ndim != 2 or y2.ndim != 2:
+        raise ValueError(f"Training and test data must be 2-D; got {y1.shape}, {y2.shape}.")
+    if y1.shape[1] % 3 != 0:
+        raise ValueError(
+            f"The flattened data width must be 3 * number_of_nodes; got {y1.shape[1]}."
+        )
+    if y2.shape[1] != y1.shape[1]:
+        raise ValueError(
+            f"Training/test data widths differ: {y1.shape[1]} vs {y2.shape[1]}."
+        )
+    if not np.all(np.isfinite(y1)) or not np.all(np.isfinite(y2)):
+        raise ValueError("Training or test data contain NaN or infinite values.")
+    if neighbor_component not in (0, 1, 2):
+        raise ValueError("neighbor_component must be 0 (x), 1 (y), or 2 (z).")
 
     l1, l2 = y1.shape
-    mn = int(l2 / 3)  # 节点数量
+    mn = l2 // 3
+    if ww.shape != (mn, mn):
+        raise ValueError(
+            f"Weighted adjacency matrix shape {ww.shape} does not match "
+            f"the data node count ({mn}, {mn})."
+        )
+    if not (0 <= she < l1 - 1):
+        raise ValueError(f"she must satisfy 0 <= she < training length - 1; got {she}.")
+    if ycn is None:
+        ycn = y2.shape[0]
+    ycn = int(ycn)
+    if ycn <= 0 or ycn > y2.shape[0]:
+        raise ValueError(f"Prediction length ycn={ycn} must be in [1, {y2.shape[0]}].")
 
-    print(f"启动 CCB4_2_2_2 (加权输入耦合版): Nodes={mn}, nn={nn}, 训练长度={l1}, 预测长度={ycn}")
+    component_name = ("x", "y", "z")[neighbor_component]
+    print(
+        f"Starting PRC: Nodes={mn}, nn={nn}, training length={l1}, "
+        f"prediction length={ycn}, neighbor component={component_name}_j"
+    )
 
     B = []
-    # 动态调整输入缩放
     max_val = np.max(np.abs(y1))
-    if max_val == 0: max_val = 1
+    if max_val == 0:
+        max_val = 1.0
     grgs = grso / max_val
 
-    # 获取每个节点的邻居列表
+    # The row-wise convention is ww[i, j]: input from node j to node i.
     wl = qiufei0(ww)
 
-    # --- 1. 训练阶段 ---
+    # 1. Training stage
     for ii in range(mn):
         B1 = rcnp()
-
-        u_self = y1[:, ii * 3: (ii + 1) * 3]
+        u_self = y1[:, ii * 3 : (ii + 1) * 3]
 
         neighbor_inputs = []
-        neighbors = wl[ii]
-        for jj in neighbors:
-            w_val = ww[ii, jj]  # 获取具体权重
-            # 提取邻居的 x 分量并加权
-            u_neigh = y1[:, jj * 3 + 0] * w_val
+        for jj in wl[ii]:
+            w_val = ww[ii, jj]
+            # Use the state component specified by the system's coupling form.
+            u_neigh = y1[:, jj * 3 + neighbor_component] * w_val
             neighbor_inputs.append(u_neigh.reshape(-1, 1))
 
         if neighbor_inputs:
-            # 拼接: (Time, 3 + num_neighbors)
             u_full = np.hstack([u_self] + neighbor_inputs)
         else:
             u_full = u_self
 
-        n1 = u_full.shape[1]  # 当前储层的输入维度
-
+        input_dim = u_full.shape[1]
         try:
-            # 参数: nn, input_dim, self_dim=3, neigh_dim=1, scale
-            B1.win = B1.fwin3(nn, n1, 3, 1, grgs)
+            B1.win = B1.fwin3(nn, input_dim, 3, 1, grgs)
         except AttributeError:
-            # 如果没有 fwin3，回退到标准 fwin
-            B1.win = B1.fwin(nn, n1, grgs)
+            # Retain compatibility with rcnp implementations without fwin3.
+            B1.win = B1.fwin(nn, input_dim, grgs)
 
-        # 设置谱半径等参数
         current_xshl = xshl
         if nn * current_xshl < 1.5:
             current_xshl = 3.0 / nn
@@ -77,132 +184,122 @@ def CCB4_2_2_2(y1, y2, ww, nn=500, grla=1e-6, grg=0.7, pbj=0.95, xshl=0.03, grso
         B1.train(u_full, grg)
         B.append(B1)
 
-    # 计算输出权重 Wout
-    # CCB4 中，每个储层只负责预测自身的 3 个变量
+    # Fit each reservoir to predict the next state of its own node.
     for ii in range(mn):
-        # 目标: 自身的未来状态
-        target = y1[she:, ii * 3: (ii + 1) * 3]
-        # 状态: 自身的储层状态 (忽略前 she 步)
-        states = B[ii].RR[she - 1: -1]
+        target = y1[she:, ii * 3 : (ii + 1) * 3]
+        states = B[ii].RR[she - 1 : -1]
         B[ii].getwout(target, states, grla)
 
-    print('已求解 wout (加权输入版)')
+    print("Readout weights fitted.")
 
-    # --- 2. 预测阶段 ---
+    # 2. Autonomous prediction stage
     yc = zeros((ycn, l2))
-    rrduo = zeros((mn, nn))  # 所有储层的状态
-
-    # 初始化状态
+    rrduo = zeros((mn, nn))
     for ii in range(mn):
         rrduo[ii] = B[ii].rr.copy()
 
     for zz in range(ycn):
-        # A. 计算当前步的预测输出 yc[zz]
-        # Output = Wout * r(t)
+        # Predict all nodes first, then update all reservoirs synchronously.
         for ii in range(mn):
-            yc[zz, ii * 3: (ii + 1) * 3] = B[ii].out @ rrduo[ii]
+            yc[zz, ii * 3 : (ii + 1) * 3] = B[ii].out @ rrduo[ii]
 
-        # B. 更新储层状态 r(t+1)
         for ii in range(mn):
-            u_self_t = yc[zz, ii * 3: (ii + 1) * 3]
-
-            # 2. 邻居部分 (来自刚刚的预测，并加权)
+            u_self_t = yc[zz, ii * 3 : (ii + 1) * 3]
             u_neigh_list = []
-            neighbors = wl[ii]
-            for jj in neighbors:
+            for jj in wl[ii]:
                 w_val = ww[ii, jj]
-                # 邻居 jj 的 x 分量
-                val_neigh = yc[zz, jj * 3 + 0] * w_val
+                val_neigh = yc[zz, jj * 3 + neighbor_component] * w_val
                 u_neigh_list.append(val_neigh)
 
             if u_neigh_list:
-                u_full_t = np.hstack([u_self_t, np.array(u_neigh_list)])
+                u_full_t = np.hstack([u_self_t, np.asarray(u_neigh_list)])
             else:
                 u_full_t = u_self_t
 
-            # 储层更新公式
             linear_part = B[ii].win @ u_full_t + B[ii].wres @ rrduo[ii] + B[ii].bk
             rrduo[ii] = (1 - B[ii].grg) * rrduo[ii] + B[ii].grg * tanh(linear_part)
 
-    print('预测完成')
-
-    # 调用比较函数 (使用第一个储层对象的工具函数)
-    vps = B[0].fbijiao(yc, y2, 0.5)
+    print("Prediction completed.")
+    vps = B[0].fbijiao(yc, y2[:ycn], 0.5)
     print(f"VPS: {vps} steps")
     return B, yc
 
 
-# ============================================================
-# Main program / 主程序
-# ============================================================
-if __name__ == "__main__":
+def save_prediction(predictions, output_file, backup_existing=True):
+    """Save predictions in the .npy format and filenames used by figure.ipynb.
 
-    # ============================================================
-    # System selection / 系统选择
-    # Change SYSTEM below to run another dynamical system.
-    # 如果想查看不同系统的 PRC 预测结果，请修改下面的 SYSTEM。（修改这里）
-    #
-    # Available options / 可选系统:
-    #   "llz_xx" -> Lorenz (x-x)
-    #   "llz_xy" -> Lorenz (x*y)
-    #   "lsl"    -> Rossler (x-x)
-    # ============================================================
-    SYSTEM = "lsl"  # Change me / 修改这里
+    If an archived result already exists, preserve its first copy as a .bak file
+    before replacing it with the newly generated prediction.
+    """
+    output_file = Path(output_file)
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if output_file.exists() and backup_existing:
+        backup_file = output_file.with_name(output_file.name + ".before_prc_correction.bak")
+        if not backup_file.exists():
+            shutil.copy2(output_file, backup_file)
+            print(f"Previous result backed up to: {backup_file}")
+
+    np.save(output_file, np.asarray(predictions))
+    print(f"Prediction saved to: {output_file}")
+
+
+def main():
+    # Select the system and network size here.
+    # Options: "llz_xx", "llz_xy", "lsl".
+    SYSTEM = "llz_xy"
     M = 10
 
     cfg = get_prc_config(SYSTEM, M)
+    data_file = _project_path(cfg["data_file"])
+    weight_file = _project_path(cfg["weight_file"])
+    output_file = _project_path(cfg["prediction_file"])
 
-    data_file = cfg["data_file"]
-    weight_file = cfg["weight_file"]
+    raw_data = _load_npy(data_file, "Input data")
+    weight_matrix = _load_npy(weight_file, "Reconstructed weighted adjacency matrix")
 
-    if not os.path.exists(data_file):
-        raise FileNotFoundError(
-            f"Data file not found / 找不到数据文件: {data_file}"
-        )
-
-    if not os.path.exists(weight_file):
-        raise FileNotFoundError(
-            f"Weight file not found / 找不到重构权重文件: {weight_file}"
-        )
-
-    raw_data = np.load(data_file)
-    weight_matrix = np.load(weight_file)
-
-    print("=" * 70)
-    print(f"System / 系统: {SYSTEM}")
-    print(f"Network size / 网络规模: M={M}")
+    print("=" * 72)
+    print(f"System: {SYSTEM}")
+    print(f"Network size: M={M}")
     print(f"Data file: {data_file}")
     print(f"Weighted network file: {weight_file}")
-    print("=" * 70)
+    component_name = ("x", "y", "z")[cfg["neighbor_component"]]
+    print(f"Neighbor input component: {component_name}_j")
+    print(f"Output file: {output_file}")
+    print("=" * 72)
 
     if raw_data.ndim == 3:
         steps, n_nodes, n_dim = raw_data.shape
+        if n_dim != 3:
+            raise ValueError(f"Expected 3 state variables per node, got {n_dim}.")
+        if n_nodes != M:
+            raise ValueError(f"Data contains {n_nodes} nodes, but M={M} was selected.")
         flat_data = raw_data.reshape(steps, n_nodes * n_dim)
     elif raw_data.ndim == 2:
         flat_data = raw_data
+        if flat_data.shape[1] != 3 * M:
+            raise ValueError(
+                f"Expected {3 * M} columns for M={M}, got {flat_data.shape[1]}."
+            )
     else:
-        raise ValueError(
-            f"Unexpected data shape / 数据维度异常: {raw_data.shape}"
-        )
+        raise ValueError(f"Unexpected data shape: {raw_data.shape}")
 
-    train_len = cfg["train_len"]
-
+    train_len = int(cfg["train_len"])
     if len(flat_data) <= train_len:
         raise ValueError(
-            f"Insufficient data length: {len(flat_data)} <= {train_len}. "
-            "The paper setting requires a complete training segment."
+            f"Insufficient data length: {len(flat_data)} <= {train_len}; "
+            "the configured training segment is not available."
         )
 
     y1_train = flat_data[:train_len]
-
     available_test = flat_data[train_len:]
-    pred_len = min(cfg["pred_len"], len(available_test))
+    pred_len = min(int(cfg["pred_len"]), len(available_test))
     y2_test = available_test[:pred_len]
 
-    print(f"Training length / 训练长度: {len(y1_train)}")
-    print(f"Prediction length / 预测长度: {len(y2_test)}")
+    print(f"Training length: {len(y1_train)}")
+    print(f"Prediction length: {len(y2_test)}")
 
-    models, predictions = CCB4_2_2_2(
+    _, predictions = CCB4_2_2_2(
         y1_train,
         y2_test,
         weight_matrix,
@@ -214,9 +311,19 @@ if __name__ == "__main__":
         grso=cfg["grso"],
         she=cfg["she"],
         ycn=len(y2_test),
+        neighbor_component=cfg["neighbor_component"],
     )
 
-    print(f"Prediction shape / 预测结果维度: {predictions.shape}")
-    print("No result files are written by this script.")
-    print("本代码不保存新的预测结果文件。")
+    if predictions.shape != y2_test.shape:
+        raise RuntimeError(
+            f"Prediction shape {predictions.shape} does not match test shape {y2_test.shape}."
+        )
+
+    # Save under the same filenames and folder read by figure.ipynb.
+    save_prediction(predictions, output_file, backup_existing=True)
+    print(f"Prediction shape: {predictions.shape}")
     print("Done.")
+
+
+if __name__ == "__main__":
+    main()
